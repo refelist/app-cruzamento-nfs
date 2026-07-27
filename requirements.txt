@@ -1,5 +1,3 @@
-Plaintext
-
 pandas
 openpyxl
 streamlit
