@@ -10,8 +10,8 @@ from openpyxl.utils import get_column_letter
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA
 # ==========================================
-st.set_page_config(page_title="Extrator TIC Trens", page_icon="🚆", layout="centered")
-st.title("Cruzamento de Pedidos e NFs - TIC Trens")
+st.set_page_config(page_title="Acompanhamento de Pedidos", page_icon="🚆", layout="centered")
+st.title("Acompanhamento de Pedidos TIC Trens - Trivia")
 st.markdown("Faça o upload dos arquivos extraídos do SAP para gerar a planilha mestra.")
 
 # ==========================================
