@@ -7,12 +7,27 @@ import streamlit as st
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
+# Tratamento de importação das dependências para PDFs
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+except ImportError:
+    convert_from_bytes = None
+    pytesseract = None
+
+
 # ==========================================
 # CONFIGURAÇÃO DA PÁGINA
 # ==========================================
 st.set_page_config(page_title="Extrator TIC Trens", page_icon="🚆", layout="centered")
 st.title("Cruzamento de Pedidos e NFs - TIC Trens")
 st.markdown("Faça o upload dos arquivos extraídos do SAP para gerar a planilha mestra.")
+
 
 # ==========================================
 # MÓDULO 1: LEITURA DE NOTAS FISCAIS (XML)
@@ -107,15 +122,21 @@ def extrair_dados_xml(arquivo_xml):
 
 
 # ==========================================
-# MÓDULO 2: LEITURA DE PEDIDOS (TXT E XLSX)
+# MÓDULO 2: PROCESSAMENTO DE TEXTO (TXT E PDF)
 # ==========================================
-def extrair_dados_txt(arquivo_txt):
+def analisar_texto_pedido(texto_completo, nome_arquivo=""):
     dados_extraidos = []
-    texto_completo = arquivo_txt.getvalue().decode('utf-8', errors='ignore')
-    linhas = texto_completo.splitlines(keepends=True)
     
+    # Tratamento para PDFs cuja extração possa fragmentar linhas e colunas (remover separadores)
+    linhas_raw = texto_completo.splitlines()
+    linhas = []
+    for linha in linhas_raw:
+        linha_limpa = linha.replace(' | ', ' ')
+        if linha_limpa.strip():
+            linhas.append(linha_limpa.strip())
+            
     data_global = None
-    match_gd = re.search(r'Data da remessa\s+(\d{2}\.\d{2}\.\d{4})', texto_completo, re.IGNORECASE)
+    match_gd = re.search(r'Data d[ae] remessa\s*(?::\s*Dia)?\s*(\d{2}\.\d{2}\.\d{4})', texto_completo, re.IGNORECASE)
     if match_gd:
         data_global = match_gd.group(1)
 
@@ -127,13 +148,25 @@ def extrair_dados_txt(arquivo_txt):
         match_fallback = re.search(r'\b(4[56]\d{8})\b', texto_completo)
         if match_fallback:
             pedido_compra = match_fallback.group(1)
+        elif re.search(r'\b(4[56]\d{8})\b', nome_arquivo):
+            pedido_compra = re.search(r'\b(4[56]\d{8})\b', nome_arquivo).group(1)
 
     i = 0
+    padrao_item = r'(?:\b\d+\s+)?(\d{6})\s+(\d+(?:\.\d+)?,\d{2})\s+([A-Za-z]{1,4})\s+([\d.,]+)(?:\s*BRL\s*/\s*[A-Za-z]+)?\s+([\d.,]+)\s*BRL'
+    
     while i < len(linhas):
-        linha = linhas[i].strip()
-        padrao_item = r'(?:\b\d+\s+)?(\d{6})\s+(\d+(?:\.\d+)?,\d{2})\s+([A-Za-z]{1,4})\s+([\d.,]+)(?:\s*BRL\s*/\s*[A-Za-z]+)?\s+([\d.,]+)\s*BRL'
+        linha = linhas[i]
         match = re.search(padrao_item, linha)
         
+        # Junta linhas quebradas caso o padrão não seja encontrado de primeira (Padrão de quebra do PDF)
+        bloco_len = 0
+        if not match and re.search(r'\b\d{6}\b', linha):
+            bloco_linhas = linhas[i:min(i+4, len(linhas))]
+            bloco = " ".join(bloco_linhas)
+            match = re.search(padrao_item, bloco)
+            if match:
+                bloco_len = len(bloco_linhas)
+
         if match:
             codigo_cliente = match.group(1)
             qtd_str = match.group(2)
@@ -142,12 +175,15 @@ def extrair_dados_txt(arquivo_txt):
             preco_tot_str = match.group(5)
             
             descricao_partes = []
-            j = i + 1
+            j = i + (bloco_len if bloco_len > 0 else 1)
+            
             while j < len(linhas):
-                proxima_linha = linhas[j].strip()
+                proxima_linha = linhas[j]
                 linha_lower = proxima_linha.lower()
                 
+                # Critérios de parada da descrição
                 if re.search(padrao_item, proxima_linha) or \
+                   (not match and re.search(r'\b\d{6}\b', proxima_linha) and i != j) or \
                    "data da remessa" in linha_lower or \
                    "texto longo:" in linha_lower or \
                    "marca:" in linha_lower or \
@@ -158,6 +194,7 @@ def extrair_dados_txt(arquivo_txt):
                    proxima_linha.startswith("***"):
                     break
                 
+                # Ignorar ruídos de paginação do PDF / TXT
                 if not proxima_linha or \
                    "página" in linha_lower or \
                    "page " in linha_lower or \
@@ -213,6 +250,49 @@ def extrair_dados_txt(arquivo_txt):
     return dados_extraidos
 
 
+def extrair_dados_txt(arquivo_txt):
+    texto_completo = arquivo_txt.getvalue().decode('utf-8', errors='ignore')
+    return analisar_texto_pedido(texto_completo, arquivo_txt.name)
+
+
+def extrair_dados_pdf(arquivo_pdf):
+    texto_completo = ""
+    bytes_pdf = arquivo_pdf.getvalue()
+    
+    # 1. Tenta extrair o texto nativo (para PDFs com caracteres selecionáveis)
+    if pdfplumber:
+        try:
+            with pdfplumber.open(io.BytesIO(bytes_pdf)) as pdf:
+                for page in pdf.pages:
+                    texto = page.extract_text()
+                    if texto:
+                        texto_completo += texto + "\n"
+        except Exception as e:
+            st.warning(f"Aviso ao ler texto nativo do PDF {arquivo_pdf.name}: {e}")
+            
+    # 2. Se não obteve texto suficiente, processa como imagem via OCR
+    if len(texto_completo.strip()) < 100:
+        texto_completo = ""
+        if convert_from_bytes and pytesseract:
+            try:
+                imagens = convert_from_bytes(bytes_pdf)
+                for img in imagens:
+                    texto = pytesseract.image_to_string(img, lang='por')
+                    texto_completo += texto + "\n"
+            except Exception as e:
+                st.error(f"Erro ao processar imagem (OCR) de {arquivo_pdf.name}. "
+                         f"Verifique se o Tesseract-OCR e o Poppler estão instalados no servidor. "
+                         f"Detalhes: {e}")
+        else:
+            st.error(f"O PDF '{arquivo_pdf.name}' aparenta ser uma imagem escaneada. "
+                     "Para processá-lo, as bibliotecas 'pdf2image' e 'pytesseract' devem estar ativas no servidor.")
+            
+    return analisar_texto_pedido(texto_completo, arquivo_pdf.name)
+
+
+# ==========================================
+# MÓDULO 3: LEITURA DE PEDIDOS (XLSX)
+# ==========================================
 def extrair_dados_xlsx(arquivo_xlsx):
     df = pd.read_excel(arquivo_xlsx, header=None)
     
@@ -312,7 +392,8 @@ col1, col2 = st.columns(2)
 with col1:
     arquivos_nfs = st.file_uploader("Notas Fiscais (XML)", type=['xml'], accept_multiple_files=True)
 with col2:
-    arquivos_pcs = st.file_uploader("Pedidos de Compra (TXT, XLSX)", type=['txt', 'xlsx'], accept_multiple_files=True)
+    # Tipo aceito foi atualizado para conter PDF
+    arquivos_pcs = st.file_uploader("Pedidos de Compra (TXT, XLSX, PDF)", type=['txt', 'xlsx', 'pdf'], accept_multiple_files=True)
 
 if st.button("Cruzar Dados e Gerar Planilha", type="primary", use_container_width=True):
     if not arquivos_nfs and not arquivos_pcs:
@@ -326,10 +407,13 @@ if st.button("Cruzar Dados e Gerar Planilha", type="primary", use_container_widt
                 todos_nfs.extend(extrair_dados_xml(nf))
                 
             for pc in arquivos_pcs:
-                if pc.name.lower().endswith('.txt'):
+                ext = pc.name.lower()
+                if ext.endswith('.txt'):
                     todos_pcs.extend(extrair_dados_txt(pc))
-                elif pc.name.lower().endswith('.xlsx'):
+                elif ext.endswith('.xlsx'):
                     todos_pcs.extend(extrair_dados_xlsx(pc))
+                elif ext.endswith('.pdf'):
+                    todos_pcs.extend(extrair_dados_pdf(pc))
 
             df_nfs = pd.DataFrame(todos_nfs) if todos_nfs else pd.DataFrame()
             df_pcs = pd.DataFrame(todos_pcs) if todos_pcs else pd.DataFrame()
@@ -469,7 +553,6 @@ if st.button("Cruzar Dados e Gerar Planilha", type="primary", use_container_widt
 
                 st.success("Operação concluída com sucesso!")
                 
-                # Exibe o botão de download com o arquivo gerado
                 st.download_button(
                     label="Baixar Planilha de Cruzamento",
                     data=output.getvalue(),
