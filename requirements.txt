@@ -1,3 +1,6 @@
 pandas
 openpyxl
 streamlit
+pdfplumber
+pdf2image
+pytesseract
